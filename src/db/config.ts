@@ -155,6 +155,20 @@ export type LcmConfig = {
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
+  /**
+   * Anti-replay flood threshold for EXTERNAL-input roles (currently `user`).
+   * Identical (conversation, role, content, created_at-in-seconds) tuples
+   * are rebroadcast-attack-shaped for inbound user inputs; default 3.
+   */
+  replayFloodThresholdExternal: number;
+  /**
+   * Anti-replay flood threshold for INTERNAL-runtime roles
+   * (`tool`, `assistant`, `system`). These messages are not subject to
+   * third-party rebroadcast and can legitimately repeat in fast sub-agent
+   * bursts (e.g. idempotent tool results). Default 32 absorbs typical bursts.
+   * Set to a positive integer to retain a sanity ceiling.
+   */
+  replayFloodThresholdInternal: number;
   /** Explicit fallback provider/model pairs for compaction summarization. */
   fallbackProviders: Array<{ provider: string; model: string }>;
   /** Legacy cache-sensitive policy. Accepted but not used for automatic compaction. */
@@ -299,6 +313,17 @@ function toPositiveInteger(value: number | undefined): number | undefined {
     return undefined;
   }
   return Math.max(1, Math.floor(value));
+}
+
+/** Accept only positive integer config values. Invalid values fall back. */
+function toStrictPositiveInteger(value: number | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
 }
 
 /** Coerce a plugin config value into a trimmed string array when possible. */
@@ -633,6 +658,12 @@ export function resolveLcmConfigWithDiagnostics(
       circuitBreakerCooldownMs:
         parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
           ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
+      replayFloodThresholdExternal:
+        toStrictPositiveInteger(parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL))
+          ?? toStrictPositiveInteger(toNumber(pc.replayFloodThresholdExternal)) ?? 3,
+      replayFloodThresholdInternal:
+        toStrictPositiveInteger(parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL))
+          ?? toStrictPositiveInteger(toNumber(pc.replayFloodThresholdInternal)) ?? 32,
       fallbackProviders:
         parseFallbackProviders(env.LCM_FALLBACK_PROVIDERS)
           ?? toFallbackProviderArray(pc.fallbackProviders) ?? [],

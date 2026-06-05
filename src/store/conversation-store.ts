@@ -42,6 +42,26 @@ type PreparedMessageInsert = CreateMessageInput & {
   identityHash: string;
 };
 
+type ExternalReplayFloodGroup = {
+  scope: "external";
+  conversationId: ConversationId;
+  role: "user";
+  createdAt: string;
+  candidateCount: number;
+};
+
+type InternalReplayFloodGroup = {
+  scope: "internal";
+  conversationId: ConversationId;
+  role: Exclude<MessageRole, "user">;
+  content: string;
+  identityHash: string;
+  createdAt: string;
+  candidateCount: number;
+};
+
+type ReplayFloodGroup = ExternalReplayFloodGroup | InternalReplayFloodGroup;
+
 export type MessageRecord = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -292,12 +312,30 @@ function normalizeMessageContentForFullTextIndex(content: string): string | null
 
 export class ConversationStore {
   private readonly fts5Available: boolean;
+  private readonly replayFloodThresholdExternal: number;
+  private readonly replayFloodThresholdInternal: number;
 
   constructor(
     private db: DatabaseSync,
-    options?: { fts5Available?: boolean },
+    options?: {
+      fts5Available?: boolean;
+      /**
+       * Anti-replay threshold for EXTERNAL-input roles (currently `user`).
+       * Defaults to 3 (legacy behaviour).
+       */
+      replayFloodThresholdExternal?: number;
+      /**
+       * Anti-replay threshold for INTERNAL-runtime roles
+       * (`tool` | `assistant` | `system`). Defaults to 32 to absorb legitimate
+       * fast-burst idempotent retries (e.g. cron sub-agent making many tool
+       * calls returning identical results within the same SQLite-second).
+       */
+      replayFloodThresholdInternal?: number;
+    },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
+    this.replayFloodThresholdExternal = options?.replayFloodThresholdExternal ?? 3;
+    this.replayFloodThresholdInternal = options?.replayFloodThresholdInternal ?? 32;
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -997,8 +1035,16 @@ export class ConversationStore {
     };
   }
 
-  private countExistingReplayRowsAtTimestamp(
+  /**
+   * Count already-persisted replay rows for one exact message identity at a
+   * timestamp. The guard's threshold is per identical message tuple, not per
+   * role-wide same-second burst.
+   */
+  private countExistingReplayRowsAtTimestampForIdentity(
     conversationId: ConversationId,
+    role: MessageRole,
+    identityHash: string,
+    content: string,
     createdAt: string,
   ): number {
     const row = this.db
@@ -1006,6 +1052,9 @@ export class ConversationStore {
         `SELECT COUNT(*) AS count
        FROM messages AS m
        WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND m.identity_hash = ?
+         AND m.content = ?
          AND m.created_at = ?
          AND length(m.content) > 0
          AND EXISTS (
@@ -1018,16 +1067,70 @@ export class ConversationStore {
              AND prior.created_at < m.created_at
          )`,
       )
-      .get(conversationId, createdAt) as unknown as CountRow | undefined;
+      .get(conversationId, role, identityHash, content, createdAt) as unknown as
+        | CountRow
+        | undefined;
     return row?.count ?? 0;
   }
 
+  /**
+   * Count already-persisted replay rows across one role and timestamp. This is
+   * used only for external user input so distinct rebroadcasted user messages
+   * share the same replay budget.
+   */
+  private countExistingReplayRowsAtTimestampForRole(
+    conversationId: ConversationId,
+    role: "user",
+    createdAt: string,
+  ): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+       FROM messages AS m
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND m.created_at = ?
+         AND length(m.content) > 0
+         AND EXISTS (
+           SELECT 1
+           FROM messages AS prior
+           WHERE prior.conversation_id = m.conversation_id
+             AND prior.identity_hash = m.identity_hash
+             AND prior.role = m.role
+             AND prior.content = m.content
+             AND prior.created_at < m.created_at
+         )`,
+      )
+      .get(conversationId, role, createdAt) as unknown as CountRow | undefined;
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Anti-replay guard against floods of identical messages at the same SQLite
+   * `created_at` second. SQLite's `datetime('now')` has second-level
+   * granularity, so legitimate fast bursts can collide with malicious replays
+   * on the raw (conversation, content, created_at) tuple.
+   *
+   * Role-aware policy (#639 fix):
+   *   - role=user        → EXTERNAL input, threshold `replayFloodThresholdExternal`
+   *                        (default 3). Preserves classic defense against
+   *                        webhook/input rebroadcast attacks.
+   *   - role=tool|assistant|system → INTERNAL runtime output, threshold
+   *                        `replayFloodThresholdInternal` (default 32).
+   *                        Tool results and assistant deltas can legitimately
+   *                        repeat (idempotent retries, status pings, etc.) and
+   *                        are not vulnerable to third-party rebroadcast.
+   *
+   * External user input keeps an aggregate role/timestamp budget to preserve
+   * replay defense. Internal runtime output uses exact message identity so
+   * distinct same-second tool results do not consume each other's budget.
+   */
   private assertNoReplayTimestampFlood(inputs: PreparedMessageInsert[]): void {
     if (inputs.length === 0) {
       return;
     }
 
-    const replicatedByConversationAndTimestamp = new Map<string, number>();
+    const replicatedByGroup = new Map<string, ReplayFloodGroup>();
     for (const input of inputs) {
       if (input.content.length === 0) {
         continue;
@@ -1041,24 +1144,68 @@ export class ConversationStore {
       if (priorCount === 0) {
         continue;
       }
-      const key = `${input.conversationId}\u0000${input.createdAt}`;
-      replicatedByConversationAndTimestamp.set(
-        key,
-        (replicatedByConversationAndTimestamp.get(key) ?? 0) + 1,
-      );
+      const key = input.role === "user"
+        ? JSON.stringify([input.conversationId, input.role, input.createdAt])
+        : JSON.stringify([
+            input.conversationId,
+            input.role,
+            input.identityHash,
+            input.content,
+            input.createdAt,
+          ]);
+      const group = replicatedByGroup.get(key);
+      if (group) {
+        group.candidateCount += 1;
+      } else if (input.role === "user") {
+        replicatedByGroup.set(key, {
+          scope: "external",
+          conversationId: input.conversationId,
+          role: input.role,
+          createdAt: input.createdAt,
+          candidateCount: 1,
+        });
+      } else {
+        replicatedByGroup.set(key, {
+          scope: "internal",
+          conversationId: input.conversationId,
+          role: input.role,
+          content: input.content,
+          identityHash: input.identityHash,
+          createdAt: input.createdAt,
+          candidateCount: 1,
+        });
+      }
     }
 
-    for (const [key, candidateCount] of replicatedByConversationAndTimestamp) {
-      const [conversationIdText, createdAt] = key.split("\u0000");
-      const conversationId = Number(conversationIdText);
-      const existingCount = this.countExistingReplayRowsAtTimestamp(conversationId, createdAt);
-      const replicatedCount = existingCount + candidateCount;
-      if (replicatedCount >= 3) {
+    for (const group of replicatedByGroup.values()) {
+      const existingCount = group.scope === "external"
+        ? this.countExistingReplayRowsAtTimestampForRole(
+            group.conversationId,
+            group.role,
+            group.createdAt,
+          )
+        : this.countExistingReplayRowsAtTimestampForIdentity(
+            group.conversationId,
+            group.role,
+            group.identityHash,
+            group.content,
+            group.createdAt,
+          );
+      const replicatedCount = existingCount + group.candidateCount;
+      const threshold = this.replayFloodThresholdForRole(group.role);
+      if (replicatedCount >= threshold) {
         throw new Error(
-          `[lcm] refused replay-like message batch: conversation=${conversationId} createdAt=${createdAt} replicatedRows=${replicatedCount}`,
+          `[lcm] refused replay-like message batch: conversation=${group.conversationId} role=${group.role} createdAt=${group.createdAt} replicatedRows=${replicatedCount} threshold=${threshold}`,
         );
       }
     }
+  }
+
+  private replayFloodThresholdForRole(role: string): number {
+    // External-input role: user messages are the rebroadcast surface.
+    if (role === "user") return this.replayFloodThresholdExternal;
+    // Internal-runtime roles: tool, assistant, system.
+    return this.replayFloodThresholdInternal;
   }
 
   private deleteMessageFromFullText(messageId: MessageId): void {
