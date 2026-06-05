@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, readFileSync, statSync } from "node:fs";
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
@@ -457,19 +457,241 @@ function extractRawIdsFromPartMetadata(metadata: string | null | undefined): str
     return [];
   }
 
-  const raw = asRecord(asRecord(parsed)?.raw);
-  if (!raw) {
+  const record = asRecord(parsed);
+  const raw = asRecord(record?.raw);
+
+  // Replay IDs can be preserved either inside the raw transcript block or
+  // as top-level metadata for string-content tool messages.
+  return [
+    safeString(raw?.id),
+    safeString(raw?.call_id),
+    safeString(raw?.toolCallId),
+    safeString(raw?.tool_call_id),
+    safeString(raw?.toolUseId),
+    safeString(raw?.tool_use_id),
+    safeString(record?.id),
+    safeString(record?.call_id),
+    safeString(record?.toolCallId),
+    safeString(record?.tool_call_id),
+    safeString(record?.toolUseId),
+    safeString(record?.tool_use_id),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function extractRawBlockIdsFromPartMetadata(metadata: string | null | undefined): string[] {
+  if (!metadata) {
     return [];
   }
 
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return [];
+  }
+
+  const raw = asRecord(asRecord(parsed)?.raw);
   return [
-    safeString(raw.id),
-    safeString(raw.call_id),
-    safeString(raw.toolCallId),
-    safeString(raw.tool_call_id),
-    safeString(raw.toolUseId),
-    safeString(raw.tool_use_id),
+    safeString(raw?.id),
+    safeString(raw?.call_id),
+    safeString(raw?.toolCallId),
+    safeString(raw?.tool_call_id),
+    safeString(raw?.toolUseId),
+    safeString(raw?.tool_use_id),
   ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function extractRawBlockSignatureFromPartMetadata(metadata: string | null | undefined): string | null {
+  if (!metadata) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return null;
+  }
+
+  const raw = asRecord(asRecord(parsed)?.raw);
+  return raw ? toJson(raw) : null;
+}
+
+function extractPlainToolReplayTextsById(message: AgentMessage): Map<string, string> {
+  const textsById = new Map<string, string>();
+  const duplicateIds = new Set<string>();
+  const addText = (replayId: string, text: string): void => {
+    if (duplicateIds.has(replayId)) {
+      return;
+    }
+    if (textsById.has(replayId)) {
+      textsById.delete(replayId);
+      duplicateIds.add(replayId);
+      return;
+    }
+    textsById.set(replayId, text);
+  };
+  if (
+    (message.role !== "toolResult" && message.role !== "tool") ||
+    !("content" in message)
+  ) {
+    return textsById;
+  }
+  const topLevel = message as unknown as Record<string, unknown>;
+  const topLevelToolCallId =
+    safeString(topLevel.toolCallId) ??
+    safeString(topLevel.tool_call_id) ??
+    safeString(topLevel.toolUseId) ??
+    safeString(topLevel.tool_use_id) ??
+    safeString(topLevel.call_id) ??
+    safeString(topLevel.id);
+  if (typeof message.content === "string") {
+    if (topLevelToolCallId) {
+      addText(topLevelToolCallId, message.content);
+    }
+    return textsById;
+  }
+  if (!Array.isArray(message.content)) {
+    return textsById;
+  }
+
+  for (const item of message.content) {
+    const record = asRecord(item);
+    if (!record) {
+      continue;
+    }
+    const rawType = safeString(record.type);
+    const replayId =
+      safeString(record.tool_use_id) ??
+      safeString(record.toolUseId) ??
+      safeString(record.tool_call_id) ??
+      safeString(record.toolCallId) ??
+      safeString(record.call_id) ??
+      safeString(record.id) ??
+      (message.content.length === 1 ? topLevelToolCallId : undefined);
+    if (!replayId) {
+      continue;
+    }
+
+    if (record.type === "text") {
+      const text = safeString(record.text);
+      if (text !== undefined) {
+        addText(replayId, text);
+      }
+      continue;
+    }
+    if (
+      rawType !== "tool_result" &&
+      rawType !== "toolResult" &&
+      rawType !== "function_call_output"
+    ) {
+      continue;
+    }
+    const textSource =
+      record.output !== undefined
+        ? record.output
+        : record.content !== undefined
+          ? record.content
+          : record;
+    const text = extractStructuredText(textSource);
+    if (text !== undefined) {
+      addText(replayId, text);
+    }
+  }
+  return textsById;
+}
+
+function stripExternalizedReplayMetadata(record: Record<string, unknown>): Record<string, unknown> {
+  const stripped = { ...record };
+  delete stripped.raw;
+  delete stripped.output;
+  delete stripped.content;
+  delete stripped.text;
+  delete stripped.externalizedFileId;
+  delete stripped.originalByteSize;
+  delete stripped.toolOutputExternalized;
+  delete stripped.externalizationReason;
+  delete stripped.rawType;
+  return stripped;
+}
+
+function canonicalizeReplayRawMetadata(record: Record<string, unknown>): Record<string, unknown> {
+  const canonical = stripExternalizedReplayMetadata(record);
+  const rawType = safeString(canonical.type);
+  if (rawType === "toolResult") {
+    canonical.type = "tool_result";
+  }
+
+  const replayId =
+    safeString(canonical.tool_use_id) ??
+    safeString(canonical.toolUseId) ??
+    safeString(canonical.tool_call_id) ??
+    safeString(canonical.toolCallId) ??
+    safeString(canonical.call_id) ??
+    safeString(canonical.id);
+  delete canonical.tool_use_id;
+  delete canonical.toolUseId;
+  delete canonical.tool_call_id;
+  delete canonical.toolCallId;
+  delete canonical.call_id;
+  delete canonical.id;
+  if (replayId) {
+    canonical[canonical.type === "function_call_output" ? "call_id" : "tool_use_id"] = replayId;
+  }
+
+  const isError = canonical.isError ?? canonical.is_error;
+  delete canonical.isError;
+  delete canonical.is_error;
+  if (typeof isError === "boolean") {
+    canonical.isError = isError;
+  }
+
+  return canonical;
+}
+
+function pickTopLevelReplayMetadata(record: Record<string, unknown>): Record<string, unknown> {
+  return {
+    originalRole: record.originalRole,
+    toolCallId: record.toolCallId,
+    toolName: record.toolName,
+    isError: record.isError,
+  };
+}
+
+function externalizedReplayMetadataMatches(
+  persistedMetadata: string | null,
+  incomingMetadata: string | null | undefined,
+): boolean {
+  let persistedParsed: unknown;
+  let incomingParsed: unknown;
+  try {
+    persistedParsed = persistedMetadata ? JSON.parse(persistedMetadata) : undefined;
+    incomingParsed = incomingMetadata ? JSON.parse(incomingMetadata) : undefined;
+  } catch {
+    return false;
+  }
+
+  const persistedRecord = asRecord(persistedParsed);
+  const incomingRecord = asRecord(incomingParsed);
+  if (!persistedRecord || !incomingRecord) {
+    return false;
+  }
+  const incomingRaw = asRecord(incomingRecord.raw);
+  if (!incomingRaw) {
+    return toJson(pickTopLevelReplayMetadata(persistedRecord)) ===
+      toJson(pickTopLevelReplayMetadata(incomingRecord));
+  }
+  if (
+    toJson(stripExternalizedReplayMetadata(persistedRecord)) !==
+    toJson(stripExternalizedReplayMetadata(incomingRecord))
+  ) {
+    return false;
+  }
+
+  const persistedRaw = asRecord(persistedRecord.raw);
+  return !!persistedRaw &&
+    toJson(canonicalizeReplayRawMetadata(persistedRaw)) ===
+      toJson(canonicalizeReplayRawMetadata(incomingRaw));
 }
 
 function formatDurationMs(durationMs: number): string {
@@ -6293,6 +6515,13 @@ export class LcmContextEngine implements ContextEngine {
            OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
            OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
            OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+           OR mp.tool_call_id = ?
+           OR json_extract(mp.metadata, '$.id') = ?
+           OR json_extract(mp.metadata, '$.call_id') = ?
+           OR json_extract(mp.metadata, '$.toolCallId') = ?
+           OR json_extract(mp.metadata, '$.tool_call_id') = ?
+           OR json_extract(mp.metadata, '$.toolUseId') = ?
+           OR json_extract(mp.metadata, '$.tool_use_id') = ?
          )
        LIMIT 1`,
     );
@@ -6307,6 +6536,13 @@ export class LcmContextEngine implements ContextEngine {
         rawId,
         rawId,
         rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
       ) as { found: number } | undefined;
       if (row?.found === 1) {
         matchedRawIds += 1;
@@ -6314,6 +6550,330 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return { candidateRawIds: candidateRawIds.size, matchedRawIds };
+  }
+
+  /** Drop exact raw-id transcript replays while preserving content-only repeated user turns. */
+  private async filterPersistedRawIdReplayBatch(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+  }): Promise<AgentMessage[]> {
+    const idMatchPredicate = `(
+      json_extract(mp.metadata, '$.raw.id') = ?
+      OR json_extract(mp.metadata, '$.raw.call_id') = ?
+      OR json_extract(mp.metadata, '$.raw.toolCallId') = ?
+      OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
+      OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
+      OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+      OR mp.tool_call_id = ?
+      OR json_extract(mp.metadata, '$.id') = ?
+      OR json_extract(mp.metadata, '$.call_id') = ?
+      OR json_extract(mp.metadata, '$.toolCallId') = ?
+      OR json_extract(mp.metadata, '$.tool_call_id') = ?
+      OR json_extract(mp.metadata, '$.toolUseId') = ?
+      OR json_extract(mp.metadata, '$.tool_use_id') = ?
+    )`;
+    const rawCoverageStmt = this.db.prepare(
+      `SELECT m.message_id AS messageId
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND ${idMatchPredicate}`,
+    );
+    const identityCoverageStmt = this.db.prepare(
+      `SELECT m.message_id AS messageId
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND m.identity_hash = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND ${idMatchPredicate}`,
+    );
+    const externalizedCoverageStmt = this.db.prepare(
+      `SELECT
+         m.message_id AS messageId,
+         json_extract(mp.metadata, '$.externalizedFileId') AS fileId,
+         json_extract(mp.metadata, '$.originalByteSize') AS originalByteSize,
+         mp.metadata AS metadata
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND json_extract(mp.metadata, '$.externalizationReason') = 'large_tool_result'
+         AND ${idMatchPredicate}`,
+    );
+    const rawBlockSignatureStmt = this.db.prepare(
+      `SELECT metadata
+       FROM message_parts
+       WHERE message_id = ?
+       ORDER BY ordinal ASC`,
+    );
+
+    const filtered: AgentMessage[] = [];
+    let replayedMessages = 0;
+
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const replayIds = new Set<string>();
+      const rawBlockIds = new Set<string>();
+      const rawBlockSignatures: string[] = [];
+      const replayIdsByPart: string[][] = [];
+      let everyPartHasRawBlockId = true;
+      const parts = buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      });
+      for (const part of parts) {
+        const partRawBlockIds = extractRawBlockIdsFromPartMetadata(part.metadata);
+        if (partRawBlockIds.length === 0) {
+          everyPartHasRawBlockId = false;
+        }
+        for (const rawId of partRawBlockIds) {
+          rawBlockIds.add(rawId);
+        }
+        const rawBlockSignature = extractRawBlockSignatureFromPartMetadata(part.metadata);
+        if (rawBlockSignature) {
+          rawBlockSignatures.push(rawBlockSignature);
+        }
+        const partReplayIds = extractRawIdsFromPartMetadata(part.metadata);
+        replayIdsByPart.push(partReplayIds);
+        for (const rawId of partReplayIds) {
+          replayIds.add(rawId);
+        }
+      }
+
+      if (replayIds.size === 0) {
+        filtered.push(message);
+        continue;
+      }
+
+      const canMatchWithoutIdentity = rawBlockIds.size > 0 && everyPartHasRawBlockId;
+      const matchedIds = canMatchWithoutIdentity ? rawBlockIds : replayIds;
+      const externalizedTextsById = extractPlainToolReplayTextsById(message);
+      const coverageByMessageId = new Map<number, Set<string>>();
+      for (const rawId of matchedIds) {
+        const rawIdArgs = [
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+        ];
+        let rows: Array<{ messageId: number }>;
+        if (canMatchWithoutIdentity) {
+          rows = rawCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            ...rawIdArgs,
+          ) as Array<{ messageId: number }>;
+        } else {
+          const identityHash = buildMessageIdentityHash(stored.role, stored.content);
+          rows = identityCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            identityHash,
+            ...rawIdArgs,
+          ) as Array<{ messageId: number }>;
+        }
+        for (const row of rows) {
+          const matchedRawIds = coverageByMessageId.get(row.messageId) ?? new Set<string>();
+          matchedRawIds.add(rawId);
+          coverageByMessageId.set(row.messageId, matchedRawIds);
+        }
+      }
+
+      let alreadyPersisted = false;
+      if (canMatchWithoutIdentity) {
+        for (const [messageId, rawIds] of coverageByMessageId.entries()) {
+          if (rawIds.size !== matchedIds.size) {
+            continue;
+          }
+          const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+          if (rows.length !== parts.length) {
+            continue;
+          }
+          let allPartsMatch = true;
+          for (let index = 0; index < rows.length; index += 1) {
+            const persistedMetadata = rows[index]!.metadata;
+            const persistedSignature = extractRawBlockSignatureFromPartMetadata(persistedMetadata);
+            if (
+              persistedSignature === rawBlockSignatures[index] &&
+              externalizedReplayMetadataMatches(persistedMetadata, parts[index]?.metadata)
+            ) {
+              continue;
+            }
+            let externalizedPartMatches = false;
+            for (const rawId of replayIdsByPart[index] ?? []) {
+              if (!extractRawIdsFromPartMetadata(persistedMetadata).includes(rawId)) {
+                continue;
+              }
+              const externalizedText = externalizedTextsById.get(rawId);
+              if (externalizedText === undefined) {
+                continue;
+              }
+              let persistedParsed: unknown;
+              try {
+                persistedParsed = persistedMetadata ? JSON.parse(persistedMetadata) : undefined;
+              } catch {
+                continue;
+              }
+              const persistedRecord = asRecord(persistedParsed);
+              const fileId = safeString(persistedRecord?.externalizedFileId);
+              const originalByteSize = persistedRecord?.originalByteSize;
+              if (
+                !fileId ||
+                Number(originalByteSize) !== Buffer.byteLength(externalizedText, "utf8")
+              ) {
+                continue;
+              }
+              const largeFile = await this.summaryStore.getLargeFile(fileId);
+              if (!largeFile) {
+                continue;
+              }
+              let storedText: string;
+              try {
+                storedText = readFileSync(largeFile.storageUri, "utf8");
+              } catch {
+                continue;
+              }
+              if (
+                storedText === externalizedText &&
+                externalizedReplayMetadataMatches(persistedMetadata, parts[index]?.metadata)
+              ) {
+                externalizedPartMatches = true;
+                break;
+              }
+            }
+            if (!externalizedPartMatches) {
+              allPartsMatch = false;
+              break;
+            }
+          }
+          if (allPartsMatch) {
+            alreadyPersisted = true;
+            break;
+          }
+        }
+      } else {
+        for (const [messageId, rawIds] of coverageByMessageId.entries()) {
+          if (rawIds.size !== matchedIds.size) {
+            continue;
+          }
+          const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+          if (
+            rows.length === parts.length &&
+            rows.every((row, index) => row.metadata === (parts[index]?.metadata ?? null))
+          ) {
+            alreadyPersisted = true;
+            break;
+          }
+        }
+      }
+
+      const canUseExternalizedFallback = parts.length === 1 || everyPartHasRawBlockId;
+      if (!alreadyPersisted && canUseExternalizedFallback && externalizedTextsById.size > 0) {
+        const externalizedCoverageByMessageId = new Map<number, Set<string>>();
+        for (const rawId of matchedIds) {
+          const externalizedText = externalizedTextsById.get(rawId);
+          if (externalizedText === undefined) {
+            continue;
+          }
+          const externalizedByteSize = Buffer.byteLength(externalizedText, "utf8");
+          const rawIdArgs = [
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+          ];
+          const rows = externalizedCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            ...rawIdArgs,
+          ) as Array<{
+            messageId: number;
+            fileId: unknown;
+            originalByteSize: unknown;
+            metadata: string | null;
+          }>;
+          for (const row of rows) {
+            if (
+              typeof row.fileId !== "string" ||
+              Number(row.originalByteSize) !== externalizedByteSize
+            ) {
+              continue;
+            }
+            const largeFile = await this.summaryStore.getLargeFile(row.fileId);
+            if (!largeFile) {
+              continue;
+            }
+            let storedText: string;
+            try {
+              storedText = readFileSync(largeFile.storageUri, "utf8");
+            } catch {
+              continue;
+            }
+            if (
+              storedText !== externalizedText ||
+              !externalizedReplayMetadataMatches(row.metadata, parts[0]?.metadata)
+            ) {
+              continue;
+            }
+            const matchedRawIds =
+              externalizedCoverageByMessageId.get(row.messageId) ?? new Set<string>();
+            matchedRawIds.add(rawId);
+            externalizedCoverageByMessageId.set(row.messageId, matchedRawIds);
+          }
+        }
+        alreadyPersisted = Array.from(externalizedCoverageByMessageId.values()).some(
+          (rawIds) => rawIds.size === matchedIds.size,
+        );
+      }
+
+      if (alreadyPersisted) {
+        replayedMessages += 1;
+      } else {
+        filtered.push(message);
+      }
+    }
+
+    if (replayedMessages > 0) {
+      const sessionContext = this.formatSessionLogContext({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      this.deps.log.warn(
+        `[lcm] ingestBatch: dropped ${replayedMessages}/${params.messages.length} raw-id replay messages for ${sessionContext}`,
+      );
+    }
+
+    return filtered;
   }
 
   /**
@@ -8320,8 +8880,23 @@ export class LcmContextEngine implements ContextEngine {
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
         return this.conversationStore.withTransaction(async () => {
+          let messages = params.messages;
+          if (!params.isHeartbeat) {
+            const conversation = await this.conversationStore.getConversationForSession({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+            if (conversation) {
+              messages = await this.filterPersistedRawIdReplayBatch({
+                conversationId: conversation.conversationId,
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                messages: params.messages,
+              });
+            }
+          }
           let ingestedCount = 0;
-          for (const message of params.messages) {
+          for (const message of messages) {
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
